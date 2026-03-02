@@ -1,23 +1,25 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
-云际会议 · 授权码下发机器人 (HUI_1)
+云际会议 · 授权码管理机器人
 
-职责：
-  1. 管理员将主机器人发来的 #YUNJICODE:XXXX 消息转发给本机器人 → 自动入库
-  2. 授权用户点「领取授权码」→ 从本地库取一个码发给用户
-  3. 授权用户点「查询授权码」→ 查看本地库的码（已使用 / 未使用）
-
-本机器人与主平台无任何直接通信，所有数据来源于本地数据库。
+功能：
+  1. 接收主机器人转发 #YUNJICODE:XXXX → 入库（未使用）
+  2. 📤 授权码（已使用）  — 显示: 授权码 · 剩余时间 + 释放房间按钮
+  3. 📦 授权码（未使用）  — 显示: 全部授权码 + 有效期
+  4. 绑定 — 首次 /start 显示介绍 + 绑定按钮（最多2个admin）
+  5. ROOT 可踢 admin；只有 admin / root 才能操作
 """
+
 import asyncio
+import json
 import logging
 import os
 import re
+from datetime import datetime, timedelta
+from urllib.request import urlopen
 
 import psycopg2
 import psycopg2.extras
-from datetime import datetime
-
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -36,201 +38,174 @@ from telegram.ext import (
 
 load_dotenv()
 
-# ============================================================
+# ═══════════════════════════════════════
 #  配置
-# ============================================================
-BOT_TOKEN    = os.getenv('BOT_TOKEN', '')
-OWNER_ID     = int(os.getenv('OWNER_TELEGRAM_ID', '0'))
-ADMIN_IDS    = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}
-ADMIN_IDS.add(OWNER_ID)
-DATABASE_URL = os.getenv('DATABASE_URL', '')
+# ═══════════════════════════════════════
+BOT_TOKEN           = os.getenv('BOT_TOKEN', '')
+OWNER_ID            = int(os.getenv('OWNER_TELEGRAM_ID', '0'))
+DATABASE_URL        = os.getenv('DATABASE_URL', '')
+CODE_DURATION_HOURS = int(os.getenv('CODE_DURATION_HOURS', '12'))
+
+logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO)
+log = logging.getLogger(__name__)
 
 
-def _auto_instance_name(token: str) -> str:
-    """从 Bot Token 自动获取 bot username 并生成实例名"""
-    import json
-    from urllib.request import urlopen
+# ── 实例名（自动从 Token 获取）──
+def _auto_instance(token: str) -> str:
     try:
-        resp = urlopen(f'https://api.telegram.org/bot{token}/getMe', timeout=10)
-        data = json.loads(resp.read())
+        data = json.loads(
+            urlopen(f'https://api.telegram.org/bot{token}/getMe', timeout=10).read()
+        )
         if data.get('ok'):
-            username = data['result'].get('username', '')
-            if username:
-                inst = re.sub(r'_?bot$', '', username.lower()).replace('-', '_')
-                inst = re.sub(r'[^a-z0-9_]', '', inst)
-                if inst:
-                    return inst
+            name = re.sub(r'_?bot$', '', data['result'].get('username', '').lower())
+            name = re.sub(r'[^a-z0-9_]', '', name.replace('-', '_'))
+            if name:
+                return name
     except Exception:
         pass
-    bot_id = token.split(':')[0] if ':' in token else 'default'
-    return f'bot_{bot_id}'
+    return f'bot_{token.split(":")[0]}' if ':' in token else 'default'
 
 
-_env_instance = os.getenv('BOT_INSTANCE', '').strip().lower().replace('-', '_')
-BOT_INSTANCE = _env_instance if _env_instance else _auto_instance_name(BOT_TOKEN)
-
-TBL_USERS = f'users_{BOT_INSTANCE}'
-TBL_CODES = f'auth_code_pool_{BOT_INSTANCE}'
-
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+_env_inst = os.getenv('BOT_INSTANCE', '').strip().lower().replace('-', '_')
+INSTANCE  = _env_inst or _auto_instance(BOT_TOKEN)
+TBL_USERS = f'users_{INSTANCE}'
+TBL_CODES = f'auth_code_pool_{INSTANCE}'
+_db_url   = re.sub(r'[&?]channel_binding=[^&]*', '', DATABASE_URL)
 
 
-# ============================================================
+# ═══════════════════════════════════════
 #  数据库
-# ============================================================
-# 清理 DATABASE_URL 中 psycopg2 不支持的参数
-import re as _re
-_clean_db_url = _re.sub(r'[&?]channel_binding=[^&]*', '', DATABASE_URL)
-
+# ═══════════════════════════════════════
 class DB:
-    def _conn(self):
-        return psycopg2.connect(_clean_db_url)
 
-    def _cur(self, conn):
-        return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    def _c(self):
+        return psycopg2.connect(_db_url)
 
-    def __init__(self):
-        conn = self._conn()
+    def init(self):
+        conn = self._c()
         cur = conn.cursor()
         cur.execute(f'''
             CREATE TABLE IF NOT EXISTS {TBL_USERS} (
-                telegram_id BIGINT PRIMARY KEY,
-                username    TEXT,
-                first_name  TEXT,
-                first_seen  TEXT NOT NULL,
-                role        TEXT DEFAULT NULL
+                telegram_id  BIGINT PRIMARY KEY,
+                username     TEXT,
+                first_name   TEXT,
+                first_seen   TEXT NOT NULL,
+                role         TEXT DEFAULT NULL
             )
         ''')
         cur.execute(f'''
             CREATE TABLE IF NOT EXISTS {TBL_CODES} (
-                pool_id     SERIAL PRIMARY KEY,
-                code        TEXT UNIQUE NOT NULL,
-                status      TEXT NOT NULL DEFAULT 'available',
-                assigned_to BIGINT DEFAULT NULL,
-                assigned_at TEXT DEFAULT NULL,
-                note        TEXT DEFAULT '',
-                added_at    TEXT NOT NULL DEFAULT TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
+                pool_id      SERIAL PRIMARY KEY,
+                code         TEXT UNIQUE NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'available',
+                assigned_to  BIGINT DEFAULT NULL,
+                assigned_at  TEXT DEFAULT NULL,
+                note         TEXT DEFAULT '',
+                added_at     TEXT NOT NULL DEFAULT TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
             )
         ''')
         cur.execute(f"""
-            SELECT column_name FROM information_schema.columns
+            SELECT 1 FROM information_schema.columns
             WHERE table_name='{TBL_USERS}' AND column_name='role'
         """)
         if not cur.fetchone():
             cur.execute(f'ALTER TABLE {TBL_USERS} ADD COLUMN role TEXT DEFAULT NULL')
         if OWNER_ID:
             cur.execute(
-                f"INSERT INTO {TBL_USERS} (telegram_id, username, first_name, first_seen, role) "
-                "VALUES (%s, '', 'ROOT', %s, 'root') "
-                "ON CONFLICT(telegram_id) DO UPDATE SET role='root'",
-                (OWNER_ID, datetime.now().isoformat())
+                f"INSERT INTO {TBL_USERS} (telegram_id,username,first_name,first_seen,role) "
+                f"VALUES (%s,'','ROOT',%s,'root') "
+                f"ON CONFLICT(telegram_id) DO UPDATE SET role='root'",
+                (OWNER_ID, datetime.now().isoformat()),
             )
         conn.commit()
         conn.close()
 
-    def track_user(self, tid, username=None, first_name=None):
-        conn = self._conn()
+    # ── 用户 ──
+    def track(self, tid, username=None, first_name=None):
+        conn = self._c()
         try:
-            cur = self._cur(conn)
-            cur.execute(
-                f'INSERT INTO {TBL_USERS} (telegram_id, username, first_name, first_seen) '
-                'VALUES (%s, %s, %s, %s) '
-                'ON CONFLICT(telegram_id) DO UPDATE SET username=%s, first_name=%s',
-                (tid, username, first_name, datetime.now().isoformat(), username, first_name)
+            conn.cursor().execute(
+                f'INSERT INTO {TBL_USERS} (telegram_id,username,first_name,first_seen) '
+                f'VALUES (%s,%s,%s,%s) '
+                f'ON CONFLICT(telegram_id) DO UPDATE SET username=%s,first_name=%s',
+                (tid, username, first_name, datetime.now().isoformat(), username, first_name),
             )
             conn.commit()
         finally:
             conn.close()
 
-    def get_role(self, tid):
+    def role(self, tid):
         if tid == OWNER_ID:
             return 'root'
-        conn = self._conn()
+        conn = self._c()
         try:
-            cur = self._cur(conn)
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             cur.execute(f'SELECT role FROM {TBL_USERS} WHERE telegram_id=%s', (tid,))
-            row = cur.fetchone()
-            return row['role'] if row else None
+            r = cur.fetchone()
+            return r['role'] if r else None
         finally:
             conn.close()
 
-    def is_authorized(self, tid):
-        return self.get_role(tid) in ('root', 'admin')
+    def is_auth(self, tid):
+        return self.role(tid) in ('root', 'admin')
 
-    def get_user_info(self, tid):
-        conn = self._conn()
+    # ── 绑定 / 解绑 ──
+    def bind(self, tid, username=None, first_name=None):
+        conn = self._c()
         try:
-            cur = self._cur(conn)
-            cur.execute(f'SELECT * FROM {TBL_USERS} WHERE telegram_id=%s', (tid,))
-            return cur.fetchone()
-        finally:
-            conn.close()
-
-    def get_all_users(self):
-        conn = self._conn()
-        try:
-            cur = self._cur(conn)
-            cur.execute(f'SELECT * FROM {TBL_USERS} ORDER BY first_seen DESC')
-            return cur.fetchall()
-        finally:
-            conn.close()
-
-    def get_admins(self):
-        conn = self._conn()
-        try:
-            cur = self._cur(conn)
-            cur.execute(f"SELECT * FROM {TBL_USERS} WHERE role='admin' ORDER BY first_seen")
-            return cur.fetchall()
-        finally:
-            conn.close()
-
-    def bind_admin(self, tid, username=None, first_name=None):
-        conn = self._conn()
-        try:
-            cur = self._cur(conn)
-            cur.execute(f"SELECT COUNT(*) as c FROM {TBL_USERS} WHERE role='admin'")
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(f"SELECT COUNT(*) AS c FROM {TBL_USERS} WHERE role='admin'")
             if cur.fetchone()['c'] >= 2:
                 return 'max'
-            cur.execute(f"SELECT role FROM {TBL_USERS} WHERE telegram_id=%s", (tid,))
+            cur.execute(f'SELECT role FROM {TBL_USERS} WHERE telegram_id=%s', (tid,))
             row = cur.fetchone()
             if row and row['role'] == 'root':
                 return 'is_root'
             if row and row['role'] == 'admin':
                 return 'already'
             cur.execute(
-                f"INSERT INTO {TBL_USERS} (telegram_id, username, first_name, first_seen, role) "
-                "VALUES (%s, %s, %s, %s, 'admin') "
-                f"ON CONFLICT(telegram_id) DO UPDATE SET role='admin', "
-                f"username=COALESCE(EXCLUDED.username, {TBL_USERS}.username), "
-                f"first_name=COALESCE(EXCLUDED.first_name, {TBL_USERS}.first_name)",
-                (tid, username or '', first_name or '', datetime.now().isoformat())
+                f"INSERT INTO {TBL_USERS} (telegram_id,username,first_name,first_seen,role) "
+                f"VALUES (%s,%s,%s,%s,'admin') "
+                f"ON CONFLICT(telegram_id) DO UPDATE SET role='admin',"
+                f"username=COALESCE(EXCLUDED.username,{TBL_USERS}.username),"
+                f"first_name=COALESCE(EXCLUDED.first_name,{TBL_USERS}.first_name)",
+                (tid, username or '', first_name or '', datetime.now().isoformat()),
             )
             conn.commit()
             return 'ok'
         finally:
             conn.close()
 
-    def unbind_admin(self, tid):
-        conn = self._conn()
+    def unbind(self, tid):
+        conn = self._c()
         try:
-            cur = self._cur(conn)
-            cur.execute(f"UPDATE {TBL_USERS} SET role=NULL WHERE telegram_id=%s AND role='admin'", (tid,))
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE {TBL_USERS} SET role=NULL WHERE telegram_id=%s AND role='admin'",
+                (tid,),
+            )
             conn.commit()
             return cur.rowcount > 0
         finally:
             conn.close()
 
-    def add_code(self, code, note=''):
-        conn = self._conn()
+    def admins(self):
+        conn = self._c()
         try:
-            cur = self._cur(conn)
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(f"SELECT * FROM {TBL_USERS} WHERE role='admin' ORDER BY first_seen")
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+    # ── 授权码 ──
+    def add_code(self, code, note=''):
+        conn = self._c()
+        try:
+            cur = conn.cursor()
             cur.execute(
-                f'INSERT INTO {TBL_CODES} (code, note) VALUES (%s, %s) ON CONFLICT DO NOTHING',
-                (code.strip().upper(), note)
+                f'INSERT INTO {TBL_CODES} (code,note) VALUES (%s,%s) ON CONFLICT DO NOTHING',
+                (code.strip().upper(), note),
             )
             conn.commit()
             return cur.rowcount > 0
@@ -240,131 +215,67 @@ class DB:
         finally:
             conn.close()
 
-    def assign_code(self, tid):
-        conn = self._conn()
+    def available(self, limit=50):
+        conn = self._c()
         try:
-            cur = self._cur(conn)
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             cur.execute(
-                f"SELECT pool_id, code FROM {TBL_CODES} WHERE status='available' ORDER BY pool_id LIMIT 1"
+                f"SELECT * FROM {TBL_CODES} WHERE status='available' ORDER BY pool_id LIMIT %s",
+                (limit,),
             )
-            row = cur.fetchone()
-            if not row:
-                return None
-            cur.execute(
-                f"UPDATE {TBL_CODES} SET status='assigned', assigned_to=%s, assigned_at=%s WHERE pool_id=%s",
-                (tid, datetime.now().isoformat(), row['pool_id'])
-            )
-            conn.commit()
-            return row['code']
+            return cur.fetchall()
         finally:
             conn.close()
 
-    def recall_code(self, pool_id, operator_id):
-        conn = self._conn()
+    def assigned(self, tid=None, limit=50):
+        conn = self._c()
         try:
-            cur = self._cur(conn)
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            base = (
+                f"SELECT c.*, u.first_name, u.username FROM {TBL_CODES} c "
+                f"LEFT JOIN {TBL_USERS} u ON c.assigned_to=u.telegram_id "
+                f"WHERE c.status='assigned' "
+            )
+            if tid:
+                cur.execute(base + "AND c.assigned_to=%s ORDER BY c.assigned_at DESC LIMIT %s", (tid, limit))
+            else:
+                cur.execute(base + "ORDER BY c.assigned_at DESC LIMIT %s", (limit,))
+            return cur.fetchall()
+        finally:
+            conn.close()
+
+    def recall(self, pool_id, operator_id):
+        conn = self._c()
+        try:
+            cur = conn.cursor()
             if operator_id == OWNER_ID:
                 cur.execute(
-                    f"UPDATE {TBL_CODES} SET status='available', assigned_to=NULL, assigned_at=NULL "
+                    f"UPDATE {TBL_CODES} SET status='available',assigned_to=NULL,assigned_at=NULL "
                     f"WHERE pool_id=%s AND status='assigned'",
-                    (pool_id,)
+                    (pool_id,),
                 )
             else:
                 cur.execute(
-                    f"UPDATE {TBL_CODES} SET status='available', assigned_to=NULL, assigned_at=NULL "
+                    f"UPDATE {TBL_CODES} SET status='available',assigned_to=NULL,assigned_at=NULL "
                     f"WHERE pool_id=%s AND assigned_to=%s AND status='assigned'",
-                    (pool_id, operator_id)
+                    (pool_id, operator_id),
                 )
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
-
-    def delete_code(self, code):
-        conn = self._conn()
-        try:
-            cur = self._cur(conn)
-            cur.execute(
-                f"DELETE FROM {TBL_CODES} WHERE code=%s AND status='available'",
-                (code.upper(),)
-            )
             conn.commit()
             return cur.rowcount > 0
         finally:
             conn.close()
 
     def stats(self):
-        conn = self._conn()
+        conn = self._c()
         try:
             cur = conn.cursor()
             cur.execute(f"SELECT COUNT(*) FROM {TBL_CODES}")
             total = cur.fetchone()[0]
             cur.execute(f"SELECT COUNT(*) FROM {TBL_CODES} WHERE status='available'")
-            available = cur.fetchone()[0]
+            avail = cur.fetchone()[0]
             cur.execute(f"SELECT COUNT(*) FROM {TBL_CODES} WHERE status='assigned'")
-            assigned = cur.fetchone()[0]
-            return {'total': total, 'available': available, 'assigned': assigned}
-        finally:
-            conn.close()
-
-    def list_available(self, limit=50):
-        conn = self._conn()
-        try:
-            cur = self._cur(conn)
-            cur.execute(f"SELECT * FROM {TBL_CODES} WHERE status='available' ORDER BY pool_id LIMIT %s", (limit,))
-            return cur.fetchall()
-        finally:
-            conn.close()
-
-    def list_assigned(self, tid=None, limit=50):
-        conn = self._conn()
-        try:
-            cur = self._cur(conn)
-            if tid:
-                cur.execute(
-                    f"SELECT acp.*, u.first_name, u.username FROM {TBL_CODES} acp "
-                    f"LEFT JOIN {TBL_USERS} u ON acp.assigned_to=u.telegram_id "
-                    "WHERE acp.status='assigned' AND acp.assigned_to=%s ORDER BY acp.assigned_at DESC LIMIT %s",
-                    (tid, limit)
-                )
-            else:
-                cur.execute(
-                    f"SELECT acp.*, u.first_name, u.username FROM {TBL_CODES} acp "
-                    f"LEFT JOIN {TBL_USERS} u ON acp.assigned_to=u.telegram_id "
-                    "WHERE acp.status='assigned' ORDER BY acp.assigned_at DESC LIMIT %s",
-                    (limit,)
-                )
-            return cur.fetchall()
-        finally:
-            conn.close()
-
-    def list_all(self, limit=30):
-        conn = self._conn()
-        try:
-            cur = self._cur(conn)
-            cur.execute(f"SELECT * FROM {TBL_CODES} ORDER BY pool_id DESC LIMIT %s", (limit,))
-            return cur.fetchall()
-        finally:
-            conn.close()
-
-    def batch_assign(self, n, operator_id):
-        conn = self._conn()
-        try:
-            cur = self._cur(conn)
-            cur.execute(
-                f"SELECT pool_id, code FROM {TBL_CODES} WHERE status='available' ORDER BY pool_id LIMIT %s", (n,)
-            )
-            rows = cur.fetchall()
-            if not rows:
-                return []
-            ids = [r['pool_id'] for r in rows]
-            placeholders = ','.join(['%s'] * len(ids))
-            cur.execute(
-                f"UPDATE {TBL_CODES} SET status='assigned', assigned_to=%s, assigned_at=%s WHERE pool_id IN ({placeholders})",
-                [operator_id, datetime.now().isoformat()] + ids
-            )
-            conn.commit()
-            return [r['code'] for r in rows]
+            used = cur.fetchone()[0]
+            return {'total': total, 'available': avail, 'assigned': used}
         finally:
             conn.close()
 
@@ -372,382 +283,276 @@ class DB:
 db = DB()
 
 
-def main_kb(role=None):
+# ═══════════════════════════════════════
+#  工具函数
+# ═══════════════════════════════════════
+def _remain(assigned_at: str) -> str:
+    """计算剩余时间"""
+    try:
+        start   = datetime.fromisoformat(assigned_at)
+        expires = start + timedelta(hours=CODE_DURATION_HOURS)
+        delta   = expires - datetime.now()
+        if delta.total_seconds() <= 0:
+            return '已过期'
+        h = int(delta.total_seconds() // 3600)
+        m = int((delta.total_seconds() % 3600) // 60)
+        return f'{h}小时{m}分' if h else f'{m}分钟'
+    except Exception:
+        return '未知'
+
+
+def _kb():
+    """底部常驻键盘 — 仅2个按钮"""
+    return ReplyKeyboardMarkup(
+        [
+            ['📤 授权码（已使用）', '📦 授权码（未使用）'],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+# ═══════════════════════════════════════
+#  /start
+# ═══════════════════════════════════════
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    db.track(u.id, u.username, u.first_name)
+    role = db.role(u.id)
+
     if role in ('root', 'admin'):
-        return ReplyKeyboardMarkup(
-            [['📤 授权码（已使用）', '📦 授权码（未使用）']],
-            resize_keyboard=True,
-            is_persistent=True,
-        )
-    return None
-
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.track_user(user.id, user.username, user.first_name)
-    role = db.get_role(user.id)
-
-    # 非 ROOT 用户自动绑定为 admin
-    if not role:
-        result = db.bind_admin(user.id, user.username, user.first_name)
-        if result == 'ok':
-            role = 'admin'
-        elif result == 'max':
-            await update.message.reply_text(
-                '☁️ <b>云际会议</b>\n━━━━━━━━━━━━━━━\n\n'
-                f'👋 你好，{user.first_name}！\n\n'
-                '⛔ 当前授权名额已满，请联系管理员。',
-                parse_mode='HTML',
-            )
-            return
-
-    msg = (
-        '☁️ <b>云际会议</b>\n━━━━━━━━━━━━━━━\n\n'
-        f'👋 欢迎，{user.first_name}！\n\n'
-        '🎫 <b>领取授权码</b> — 获取一个会议授权码\n'
-        '🔍 <b>查询授权码</b> — 查看已使用 / 未使用\n\n'
-        '📌 <b>使用说明</b>\n━━━━━━━━━━━━━━━\n'
-        '🟢 创建会议：<code>授权码 + 房间号</code>\n'
-        '🔵 加入会议：<code>创建者授权码 + 房间号</code>\n\n'
-        '⏰ 第一次开房间后开始计时\n'
-        '🔑 一码一房间，会议结束后可再次开房间'
-    )
-
-    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=main_kb(role))
-
-
-async def query_assigned_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """底部键盘 — 查看已使用授权码"""
-    user = update.effective_user
-    db.track_user(user.id, user.username, user.first_name)
-    if not db.is_authorized(user.id):
+        s = db.stats()
         await update.message.reply_text(
-            '⛔ 您尚未被授权，请联系管理员绑定您的 ID：\n\n'
-            f'<code>{user.id}</code>', parse_mode='HTML')
-        return
-    role = db.get_role(user.id)
-    rows = db.list_assigned(tid=None if role == 'root' else user.id)
-    if not rows:
-        await update.message.reply_text(
-            '📤 <b>已使用 0 个</b>\n━━━━━━━━━━━━━━━\n\n暂无已使用的授权码',
-            parse_mode='HTML', reply_markup=main_kb(role))
-        return
-    msg = f'📤 <b>已使用 {len(rows)} 个</b>\n━━━━━━━━━━━━━━━\n'
-    buttons = []
-    for row in rows:
-        code_val = row['code']
-        at_time = row.get('assigned_at', '') or ''
-        if at_time:
-            at_time = at_time[:16].replace('T', ' ')
-        if row['assigned_to'] and row['assigned_to'] != 0:
-            fname = row.get('first_name') or str(row['assigned_to'])
-            uname = f"@{row['username']}" if row.get('username') else ''
-            who = f"{fname}{(' '+uname) if uname else ''}"
-        else:
-            who = '管理员取出'
-        label = f'📤 {code_val}  →  {who}'
-        if at_time:
-            label += f'  ⏰{at_time}'
-        buttons.append([
-            InlineKeyboardButton(label, callback_data='noop'),
-            InlineKeyboardButton('回收', callback_data=f'recall:{row["pool_id"]}'),
-        ])
-    await update.message.reply_text(msg, parse_mode='HTML',
-        reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def query_available_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """底部键盘 — 查看未使用授权码"""
-    user = update.effective_user
-    db.track_user(user.id, user.username, user.first_name)
-    if not db.is_authorized(user.id):
-        await update.message.reply_text(
-            '⛔ 您尚未被授权，请联系管理员绑定您的 ID：\n\n'
-            f'<code>{user.id}</code>', parse_mode='HTML')
-        return
-    role = db.get_role(user.id)
-    rows = db.list_available(50)
-    s = db.stats()
-    msg = f'📦 <b>未使用授权码</b>\n━━━━━━━━━━━━━━━\n\n共 <b>{s["available"]}</b> 个\n\n'
-    if rows:
-        line_codes = [f'<code>{r["code"]}</code>' for r in rows]
-        for i in range(0, len(line_codes), 3):
-            msg += '  '.join(line_codes[i:i+3]) + '\n'
-    else:
-        msg += '暂无未使用的授权码\n'
-    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=main_kb(role))
-
-
-async def claim_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.track_user(user.id, user.username, user.first_name)
-
-    if not db.is_authorized(user.id):
-        await update.message.reply_text(
-            '⛔ 您尚未被授权，请联系管理员绑定您的 ID：\n\n'
-            f'<code>{user.id}</code>',
-            parse_mode='HTML',
+            f'☁️ <b>云际会议</b>\n━━━━━━━━━━━━━━━\n\n'
+            f'👋 欢迎回来，{u.first_name}！\n\n'
+            f'📊 授权码：共 <b>{s["total"]}</b> · '
+            f'已使用 <b>{s["assigned"]}</b> · '
+            f'未使用 <b>{s["available"]}</b>\n\n'
+            f'👇 点击下方按钮查看',
+            parse_mode='HTML', reply_markup=_kb(),
         )
         return
 
-    code = db.assign_code(user.id)
-    if not code:
-        await update.message.reply_text(
-            '❌ <b>暂无可用授权码</b>\n\n请联系管理员补充。',
-            parse_mode='HTML',
-            reply_markup=main_kb(db.get_role(user.id)),
-        )
-        return
-
-    s = db.stats()
     await update.message.reply_text(
-        '✅ <b>领取成功！</b>\n━━━━━━━━━━━━━━━\n\n'
-        f'🔑 授权码：<code>{code}</code>\n\n'
-        '📌 创建会议：<code>授权码 + 房间号</code>\n'
-        '📌 加入会议：<code>创建者授权码 + 房间号</code>\n\n'
-        f'📦 剩余未使用：<b>{s["available"]}</b> 个',
+        '☁️ <b>云际会议 · 授权码管理</b>\n'
+        '━━━━━━━━━━━━━━━\n\n'
+        '📌 <b>使用说明</b>\n\n'
+        '  🟢 <b>创建会议</b>：授权码 + 房间号\n'
+        '  🔵 <b>加入会议</b>：创建者授权码 + 房间号\n\n'
+        '  ⏰ 第一次进入房间后授权码开始计时\n'
+        '  🔑 一码一房间，会议结束后可再次开设\n\n'
+        '━━━━━━━━━━━━━━━\n'
+        '点击下方按钮绑定为管理员（名额有限）',
         parse_mode='HTML',
-        reply_markup=main_kb(db.get_role(user.id)),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton('🔗 绑定', callback_data='bind')]
+        ]),
     )
 
 
-async def query_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.track_user(user.id, user.username, user.first_name)
-
-    if not db.is_authorized(user.id):
-        await update.message.reply_text(
-            '⛔ 您尚未被授权，请联系管理员绑定您的 ID：\n\n'
-            f'<code>{user.id}</code>',
-            parse_mode='HTML',
-        )
+# ═══════════════════════════════════════
+#  /unbind — ROOT 踢 admin
+# ═══════════════════════════════════════
+async def cmd_unbind(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if db.role(u.id) != 'root':
+        await update.message.reply_text('⛔ 只有 ROOT 才能解绑')
         return
 
-    role = db.get_role(user.id)
-    s = db.stats()
+    admins = db.admins()
+    if not admins:
+        await update.message.reply_text('当前没有绑定的管理员')
+        return
 
-    # 已分发（使用中）
-    assigned = db.list_assigned(tid=None if role == 'root' else user.id)
-    # 未使用
-    available = db.list_available(50)
+    buttons = []
+    for a in admins:
+        name = a.get('first_name') or str(a['telegram_id'])
+        uname = f" @{a['username']}" if a.get('username') else ''
+        buttons.append([
+            InlineKeyboardButton(f'❌ 踢出 {name}{uname}', callback_data=f'kick:{a["telegram_id"]}')
+        ])
 
-    msg = '📋 <b>授权码查询</b>\n━━━━━━━━━━━━━━━\n\n'
-
-    # —— 使用中 ——
-    if assigned:
-        msg += f'🔴 <b>使用中（{len(assigned)} 个）</b>\n'
-        for row in assigned:
-            code_val = row['code']
-            at_time = row.get('assigned_at', '') or ''
-            if at_time:
-                at_time = at_time[:16].replace('T', ' ')
-            if row['assigned_to'] and row['assigned_to'] != 0:
-                fname = row.get('first_name') or str(row['assigned_to'])
-                uname = f"@{row['username']}" if row.get('username') else ''
-                who = f"{fname}{(' ' + uname) if uname else ''}"
-            else:
-                who = '管理员取出'
-            time_str = f'  ⏰{at_time}' if at_time else ''
-            msg += f'  <code>{code_val}</code>  →  {who}{time_str}\n'
-        msg += '\n'
-    else:
-        msg += '🔴 <b>使用中（0 个）</b>\n  暂无\n\n'
-
-    # —— 未使用 ——
-    if available:
-        msg += f'🟢 <b>未使用（{s["available"]} 个）</b>\n'
-        line_codes = [f'<code>{r["code"]}</code>' for r in available]
-        for i in range(0, len(line_codes), 3):
-            msg += '  ' + '  '.join(line_codes[i:i + 3]) + '\n'
-        msg += '\n'
-    else:
-        msg += '🟢 <b>未使用（0 个）</b>\n  暂无\n\n'
-
-    msg += f'📊 总计 <b>{s["total"]}</b> 个 | 使用中 <b>{s["assigned"]}</b> | 未使用 <b>{s["available"]}</b>'
-
-    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=main_kb(role))
+    await update.message.reply_text(
+        '👥 <b>当前管理员</b>\n\n点击踢出：',
+        parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
-async def _show_assigned(query, uid):
-    role = db.get_role(uid)
-    rows = db.list_assigned(tid=None if role == 'root' else uid)
+# ═══════════════════════════════════════
+#  底部键盘 — 已使用 / 未使用
+# ═══════════════════════════════════════
+async def show_used(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    db.track(u.id, u.username, u.first_name)
+    if not db.is_auth(u.id):
+        await update.message.reply_text('⛔ 未绑定，请先 /start 后点击「绑定」')
+        return
+
+    role = db.role(u.id)
+    rows = db.assigned(tid=None if role == 'root' else u.id)
 
     if not rows:
-        await query.edit_message_text(
-            '📤 当前没有已使用的授权码',
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('« 返回', callback_data='query_back')]])
+        await update.message.reply_text(
+            '📤 <b>已使用 0 个</b>\n━━━━━━━━━━━━━━━\n\n暂无',
+            parse_mode='HTML', reply_markup=_kb(),
         )
         return
 
     msg = f'📤 <b>已使用 {len(rows)} 个</b>\n━━━━━━━━━━━━━━━\n'
     buttons = []
-    for row in rows:
-        code_val = row['code']
-        at_time = row.get('assigned_at', '') or ''
-        if at_time:
-            at_time = at_time[:16].replace('T', ' ')  # 只显示到分钟
-        if row['assigned_to'] and row['assigned_to'] != 0:
-            fname = row.get('first_name') or str(row['assigned_to'])
-            uname = f"@{row['username']}" if row.get('username') else ''
-            who = f"{fname}{(' '+uname) if uname else ''}"
-        else:
-            who = '管理员取出'
-        label = f'📤 {code_val}  →  {who}'
-        if at_time:
-            label += f'  ⏰{at_time}'
+    for r in rows:
+        at     = r.get('assigned_at') or ''
+        remain = _remain(at) if at else f'{CODE_DURATION_HOURS}小时'
         buttons.append([
-            InlineKeyboardButton(label, callback_data='noop'),
-            InlineKeyboardButton('回收', callback_data=f'recall:{row["pool_id"]}'),
+            InlineKeyboardButton(f'🔑 {r["code"]}  ⏳ {remain}', callback_data='noop'),
+            InlineKeyboardButton('🏠 释放房间', callback_data=f'end:{r["pool_id"]}'),
         ])
 
-    buttons.append([InlineKeyboardButton('« 返回', callback_data='query_back')])
-    await query.edit_message_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup(buttons))
+    await update.message.reply_text(
+        msg, parse_mode='HTML',
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 
-async def _show_available(query, uid):
-    rows = db.list_available(50)
+async def show_unused(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    db.track(u.id, u.username, u.first_name)
+    if not db.is_auth(u.id):
+        await update.message.reply_text('⛔ 未绑定，请先 /start 后点击「绑定」')
+        return
+
+    rows = db.available(50)
     s = db.stats()
 
-    msg = (
-        f'📦 <b>未使用授权码</b>\n━━━━━━━━━━━━━━━\n\n'
-        f'共 <b>{s["available"]}</b> 个\n\n'
-    )
+    msg = f'📦 <b>未使用 {s["available"]} 个</b>\n━━━━━━━━━━━━━━━\n\n'
     if rows:
-        # 一排3个显示
-        line_codes = []
-        for row in rows:
-            line_codes.append(f'<code>{row["code"]}</code>')
-        for i in range(0, len(line_codes), 3):
-            msg += '  '.join(line_codes[i:i+3]) + '\n'
+        for r in rows:
+            msg += f'  <code>{r["code"]}</code>  {CODE_DURATION_HOURS}小时\n'
     else:
-        msg += '暂无未使用的授权码\n'
+        msg += '暂无\n'
 
-    await query.edit_message_text(msg, parse_mode='HTML',
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('« 返回', callback_data='query_back')]]))
+    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=_kb())
 
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ''
-    uid = query.from_user.id
+# show_query 已移除 — 仅保留「已使用」和「未使用」两个按钮
+
+
+# ═══════════════════════════════════════
+#  回调按钮
+# ═══════════════════════════════════════
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    uid  = q.from_user.id
+    data = q.data or ''
+    await q.answer()
 
     if data == 'noop':
         return
 
-    if data == 'query_assigned':
-        await _show_assigned(query, uid)
+    # ── 绑定 ──
+    if data == 'bind':
+        result = db.bind(uid, q.from_user.username, q.from_user.first_name)
+        msgs = {
+            'ok':      ('✅ <b>绑定成功！</b>\n\n欢迎，你已成为管理员。', True),
+            'max':     ('⛔ 管理员名额已满（最多 2 个），请联系 ROOT。', False),
+            'already': ('✅ 你已经是管理员了。', True),
+            'is_root': ('👑 你是 ROOT，无需绑定。', True),
+        }
+        text, show_kb = msgs.get(result, ('❌ 绑定失败', False))
+        await q.edit_message_text(text, parse_mode='HTML')
+        if show_kb:
+            await q.message.reply_text('👇 使用下方按钮操作', reply_markup=_kb())
         return
 
-    if data == 'query_available':
-        await _show_available(query, uid)
-        return
-
-    if data == 'query_back':
-        s = db.stats()
-        msg = (
-            f'📋 <b>授权码总览</b>\n'
-            f'总数：<b>{s["total"]}</b> 个\n'
-            f'未使用：<b>{s["available"]}</b> 个\n'
-            f'已使用：<b>{s["assigned"]}</b> 个'
-        )
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton('📤 已使用', callback_data='query_assigned'),
-            InlineKeyboardButton('📦 未使用', callback_data='query_available'),
-        ]])
-        await query.edit_message_text(msg, parse_mode='HTML', reply_markup=kb)
-        return
-
-    if data.startswith('recall:'):
-        try:
-            pool_id = int(data.split(':')[1])
-        except (IndexError, ValueError):
-            await query.edit_message_text('❌ 无效操作')
-            return
-        ok = db.recall_code(pool_id, uid)
+    # ── 结束（回收）──
+    if data.startswith('end:'):
+        pool_id = int(data.split(':')[1])
+        ok = db.recall(pool_id, uid)
         if ok:
             s = db.stats()
-            await query.edit_message_text(
-                f'✅ <b>回收成功</b>\n📦 未使用：<b>{s["available"]}</b> 个',
-                parse_mode='HTML'
+            await q.edit_message_text(
+                f'✅ <b>房间已释放</b>\n\n'
+                f'授权码已回收至未使用\n'
+                f'📦 未使用：<b>{s["available"]}</b> 个',
+                parse_mode='HTML',
             )
         else:
-            await query.edit_message_text('❌ 回收失败（该码不属于您或已回收）')
+            await q.edit_message_text('❌ 操作失败（不属于您或已回收）')
+        return
+
+    # ── ROOT 踢人 ──
+    if data.startswith('kick:'):
+        if uid != OWNER_ID:
+            await q.edit_message_text('⛔ 只有 ROOT 才能踢人')
+            return
+        target = int(data.split(':')[1])
+        ok = db.unbind(target)
+        await q.edit_message_text(
+            f'✅ 已解绑 <code>{target}</code>' if ok else '❌ 解绑失败',
+            parse_mode='HTML',
+        )
+        return
 
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+# ═══════════════════════════════════════
+#  文本消息
+# ═══════════════════════════════════════
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u    = update.effective_user
     text = (update.message.text or '').strip()
 
-    if uid in ADMIN_IDS and '#YUNJICODE:' in text:
+    # ── 接收主机器人授权码 ──
+    if db.is_auth(u.id) and '#YUNJICODE:' in text:
         found = re.findall(r'#YUNJICODE:([A-Za-z0-9_\-]+)', text)
         if found:
             ok_list, dup_list = [], []
-            for code in found:
-                if db.add_code(code.upper(), note='主机器人下发'):
-                    ok_list.append(code.upper())
-                else:
-                    dup_list.append(code.upper())
+            for c in found:
+                (ok_list if db.add_code(c.upper(), '主机器人下发') else dup_list).append(c.upper())
             s = db.stats()
             lines = []
             if ok_list:
-                lines.append(f'✅ 入库 {len(ok_list)} 个：' + ', '.join(f'<code>{c}</code>' for c in ok_list))
+                lines.append(f'✅ 入库 {len(ok_list)} 个：' +
+                             ', '.join(f'<code>{c}</code>' for c in ok_list))
             if dup_list:
-                lines.append(f'⚠️ 重复跳过 {len(dup_list)} 个：' + ', '.join(f'<code>{c}</code>' for c in dup_list))
-            lines.append(f'📦 当前可分发：<b>{s["available"]}</b> 个')
+                lines.append(f'⚠️ 重复 {len(dup_list)} 个：' +
+                             ', '.join(f'<code>{c}</code>' for c in dup_list))
+            lines.append(f'📦 未使用：<b>{s["available"]}</b> 个')
             await update.message.reply_text('\n'.join(lines), parse_mode='HTML')
             return
 
+    # ── 底部键盘 ──
     if text == '📤 授权码（已使用）':
-        await query_assigned_direct(update, context)
+        await show_used(update, ctx)
     elif text == '📦 授权码（未使用）':
-        await query_available_direct(update, context)
+        await show_unused(update, ctx)
     else:
-        role = db.get_role(uid)
+        role = db.role(u.id)
         if role:
-            await update.message.reply_text('请使用下方按钮操作 👇', reply_markup=main_kb(role))
+            await update.message.reply_text('👇 请使用下方按钮', reply_markup=_kb())
         else:
-            await update.message.reply_text(
-                '⛔ 您尚未被授权，请联系管理员绑定您的 ID：\n\n'
-                f'<code>{uid}</code>',
-                parse_mode='HTML',
-            )
+            await update.message.reply_text('⛔ 未绑定，请先 /start 后点击「绑定」')
 
 
-
-
-
-async def unbind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    role = db.get_role(user.id)
-    if role == 'root':
-        await update.message.reply_text('⚠️ ROOT 无法解绑自己')
-        return
-    if role != 'admin':
-        await update.message.reply_text('⛔ 您未被绑定')
-        return
-    ok = db.unbind_admin(user.id)
-    await update.message.reply_text('✅ 已解除绑定' if ok else '❌ 解绑失败')
-
-
-
-
-
-async def on_error(update, context):
-    logger.exception('Unhandled exception', exc_info=context.error)
+# ═══════════════════════════════════════
+#  错误处理 & 启动
+# ═══════════════════════════════════════
+async def on_error(update, ctx):
+    log.exception('Unhandled', exc_info=ctx.error)
 
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError('BOT_TOKEN 未设置')
+    db.init()
     asyncio.set_event_loop(asyncio.new_event_loop())
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler('start', start_cmd))
-    app.add_handler(CommandHandler('unbind', unbind_cmd))
+    app.add_handler(CommandHandler('start', cmd_start))
+    app.add_handler(CommandHandler('unbind', cmd_unbind))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
-    logger.info('☁️ 授权码下发机器人启动...')
+    log.info('☁️ 授权码管理机器人启动...')
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
