@@ -1,11 +1,11 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
-云际会议 · 授权码管理机器人 (HUI_1)
+云际会议 · 授权码管理机器人
 
 功能：
   1. 接收主机器人转发 #YUNJICODE:XXXX → 入库（未使用）
-  2. 📤 授权码（已使用）  — 显示: CODE — 剩余时间 + 结束按钮
-  3. 📦 授权码（未使用）  — 显示: CODE  12小时
+  2. 📤 授权码（已使用）  — 显示: 授权码 · 剩余时间 + 释放房间按钮
+  3. 📦 授权码（未使用）  — 显示: 全部授权码 + 有效期
   4. 绑定 — 首次 /start 显示介绍 + 绑定按钮（最多2个admin）
   5. ROOT 可踢 admin；只有 admin / root 才能操作
 """
@@ -302,11 +302,10 @@ def _remain(assigned_at: str) -> str:
 
 
 def _kb():
-    """底部常驻键盘"""
+    """底部常驻键盘 — 仅2个按钮"""
     return ReplyKeyboardMarkup(
         [
             ['📤 授权码（已使用）', '📦 授权码（未使用）'],
-            ['🔍 查询授权码'],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -406,8 +405,8 @@ async def show_used(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         at     = r.get('assigned_at') or ''
         remain = _remain(at) if at else f'{CODE_DURATION_HOURS}小时'
         buttons.append([
-            InlineKeyboardButton(f'{r["code"]} — {remain}', callback_data='noop'),
-            InlineKeyboardButton('结束', callback_data=f'end:{r["pool_id"]}'),
+            InlineKeyboardButton(f'🔑 {r["code"]}  ⏳ {remain}', callback_data='noop'),
+            InlineKeyboardButton('🏠 释放房间', callback_data=f'end:{r["pool_id"]}'),
         ])
 
     await update.message.reply_text(
@@ -436,45 +435,7 @@ async def show_unused(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode='HTML', reply_markup=_kb())
 
 
-async def show_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """查询授权码 — 综合视图"""
-    u = update.effective_user
-    db.track(u.id, u.username, u.first_name)
-    if not db.is_auth(u.id):
-        await update.message.reply_text('⛔ 未绑定，请先 /start 后点击「绑定」')
-        return
-
-    role = db.role(u.id)
-    s = db.stats()
-    assigned = db.assigned(tid=None if role == 'root' else u.id)
-    available = db.available(50)
-
-    msg = '📋 <b>授权码查询</b>\n━━━━━━━━━━━━━━━\n\n'
-
-    # 已使用
-    if assigned:
-        msg += f'📤 <b>已使用（{len(assigned)} 个）</b>\n'
-        for r in assigned:
-            at = r.get('assigned_at') or ''
-            remain = _remain(at) if at else f'{CODE_DURATION_HOURS}小时'
-            msg += f'  <code>{r["code"]}</code>  — {remain}\n'
-        msg += '\n'
-    else:
-        msg += '📤 <b>已使用（0 个）</b>\n  暂无\n\n'
-
-    # 未使用
-    if available:
-        msg += f'📦 <b>未使用（{s["available"]} 个）</b>\n'
-        codes = [f'<code>{r["code"]}</code>' for r in available]
-        for i in range(0, len(codes), 3):
-            msg += '  ' + '  '.join(codes[i:i+3]) + '\n'
-        msg += '\n'
-    else:
-        msg += '📦 <b>未使用（0 个）</b>\n  暂无\n\n'
-
-    msg += f'📊 总计 <b>{s["total"]}</b> · 已使用 <b>{s["assigned"]}</b> · 未使用 <b>{s["available"]}</b>'
-
-    await update.message.reply_text(msg, parse_mode='HTML', reply_markup=_kb())
+# show_query 已移除 — 仅保留「已使用」和「未使用」两个按钮
 
 
 # ═══════════════════════════════════════
@@ -511,7 +472,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if ok:
             s = db.stats()
             await q.edit_message_text(
-                f'✅ <b>已结束</b>\n\n'
+                f'✅ <b>房间已释放</b>\n\n'
                 f'授权码已回收至未使用\n'
                 f'📦 未使用：<b>{s["available"]}</b> 个',
                 parse_mode='HTML',
@@ -565,8 +526,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_used(update, ctx)
     elif text == '📦 授权码（未使用）':
         await show_unused(update, ctx)
-    elif text == '🔍 查询授权码':
-        await show_query(update, ctx)
     else:
         role = db.role(u.id)
         if role:
