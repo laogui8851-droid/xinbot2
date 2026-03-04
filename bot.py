@@ -232,8 +232,12 @@ class DB:
         try:
             cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             base = (
-                f"SELECT c.*, u.first_name, u.username FROM {TBL_CODES} c "
+                f"SELECT c.pool_id, c.code, c.status, c.assigned_to, c.assigned_at, "
+                f"c.note, u.first_name, u.username, "
+                f"COALESCE(ap.bound_room, '') AS bound_room "
+                f"FROM {TBL_CODES} c "
                 f"LEFT JOIN {TBL_USERS} u ON c.assigned_to=u.telegram_id "
+                f"LEFT JOIN auth_code_pool ap ON UPPER(c.code)=UPPER(ap.code) "
                 f"WHERE c.status='assigned' "
             )
             if tid:
@@ -248,6 +252,11 @@ class DB:
         conn = self._c()
         try:
             cur = conn.cursor()
+            # 先获取 code 以便同步释放 auth_code_pool
+            cur.execute(f"SELECT code FROM {TBL_CODES} WHERE pool_id=%s", (pool_id,))
+            row = cur.fetchone()
+            code = row[0] if row else None
+
             if operator_id == OWNER_ID:
                 cur.execute(
                     f"UPDATE {TBL_CODES} SET status='available',assigned_to=NULL,assigned_at=NULL "
@@ -260,8 +269,63 @@ class DB:
                     f"WHERE pool_id=%s AND assigned_to=%s AND status='assigned'",
                     (pool_id, operator_id),
                 )
+            ok = cur.rowcount > 0
+            # 同步释放 auth_code_pool 中的房间
+            if ok and code:
+                try:
+                    cur.execute(
+                        "UPDATE auth_code_pool SET in_use=0, bound_room=NULL "
+                        "WHERE UPPER(code)=UPPER(%s)",
+                        (code,)
+                    )
+                except Exception:
+                    pass
             conn.commit()
-            return cur.rowcount > 0
+            return ok
+        finally:
+            conn.close()
+
+    def auto_release_expired(self):
+        """自动释放已过期的授权码，返回释放数量"""
+        conn = self._c()
+        try:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(
+                f"SELECT pool_id, code, assigned_at FROM {TBL_CODES} "
+                f"WHERE status='assigned' AND assigned_at IS NOT NULL"
+            )
+            rows = cur.fetchall()
+            expired_codes, expired_ids = [], []
+            now = datetime.now()
+            for r in rows:
+                try:
+                    start = datetime.fromisoformat(r['assigned_at'])
+                    if now > start + timedelta(hours=CODE_DURATION_HOURS):
+                        expired_codes.append(r['code'])
+                        expired_ids.append(r['pool_id'])
+                except Exception:
+                    pass
+            if expired_ids:
+                cur2 = conn.cursor()
+                cur2.execute(
+                    f"UPDATE {TBL_CODES} SET status='available', assigned_to=NULL, assigned_at=NULL "
+                    f"WHERE pool_id = ANY(%s)",
+                    (expired_ids,)
+                )
+                try:
+                    cur2.execute(
+                        "UPDATE auth_code_pool SET in_use=0, bound_room=NULL "
+                        "WHERE code = ANY(%s)",
+                        (expired_codes,)
+                    )
+                except Exception:
+                    pass
+                conn.commit()
+            return len(expired_ids)
+        except Exception as e:
+            conn.rollback()
+            log.error(f'auto_release_expired error: {e}')
+            return 0
         finally:
             conn.close()
 
@@ -299,6 +363,24 @@ def _remain(assigned_at: str) -> str:
         return f'{h}小时{m}分' if h else f'{m}分钟'
     except Exception:
         return '未知'
+
+
+def _time_info(assigned_at: str):
+    """返回 (开始时间, 结束时间, 剩余时间, 是否过期)"""
+    try:
+        start = datetime.fromisoformat(assigned_at)
+        end   = start + timedelta(hours=CODE_DURATION_HOURS)
+        delta = end - datetime.now()
+        s_str = start.strftime('%m-%d %H:%M')
+        e_str = end.strftime('%m-%d %H:%M')
+        if delta.total_seconds() <= 0:
+            return s_str, e_str, '已过期', True
+        h = int(delta.total_seconds() // 3600)
+        m = int((delta.total_seconds() % 3600) // 60)
+        remain = f'{h}小时{m}分' if h else f'{m}分钟'
+        return s_str, e_str, remain, False
+    except Exception:
+        return '—', '—', '未知', False
 
 
 def _kb():
@@ -389,24 +471,39 @@ async def show_used(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('⛔ 未绑定，请先 /start 后点击「绑定」')
         return
 
+    # ── 自动释放已过期的授权码 ──
+    expired_count = db.auto_release_expired()
+
     role = db.role(u.id)
     rows = db.assigned(tid=None if role == 'root' else u.id)
 
+    msg = ''
+    if expired_count:
+        msg += f'⏰ 已过期 <b>{expired_count}</b> 个（已自动释放）\n\n'
+
     if not rows:
-        await update.message.reply_text(
-            '📤 <b>已使用 0 个</b>\n━━━━━━━━━━━━━━━\n\n暂无',
-            parse_mode='HTML', reply_markup=_kb(),
-        )
+        msg += '📤 <b>使用中 0 个</b>\n━━━━━━━━━━━━━━━\n\n暂无'
+        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=_kb())
         return
 
-    msg = f'📤 <b>已使用 {len(rows)} 个</b>\n━━━━━━━━━━━━━━━\n'
+    msg += f'📤 <b>使用中 {len(rows)} 个</b>\n━━━━━━━━━━━━━━━\n\n'
     buttons = []
-    for r in rows:
-        at     = r.get('assigned_at') or ''
-        remain = _remain(at) if at else f'{CODE_DURATION_HOURS}小时'
+    for i, r in enumerate(rows, 1):
+        at   = r.get('assigned_at') or ''
+        room = r.get('bound_room') or '—'
+        if at:
+            s_str, e_str, remain, _ = _time_info(at)
+        else:
+            s_str, e_str, remain = '—', '—', f'{CODE_DURATION_HOURS}小时'
+        msg += (
+            f'{i}. 🔑 <code>{r["code"]}</code>  🏠 {room}\n'
+            f'    ⏰ {s_str} → {e_str} · 剩余 <b>{remain}</b>\n\n'
+        )
         buttons.append([
-            InlineKeyboardButton(f'🔑 {r["code"]}  ⏳ {remain}', callback_data='noop'),
-            InlineKeyboardButton('🏠 释放房间', callback_data=f'end:{r["pool_id"]}'),
+            InlineKeyboardButton(
+                f'🏠 释放 {r["code"]}',
+                callback_data=f'end:{r["pool_id"]}'
+            )
         ])
 
     await update.message.reply_text(
