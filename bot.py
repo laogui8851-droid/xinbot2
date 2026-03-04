@@ -527,10 +527,10 @@ async def show_used(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text('暂无', reply_markup=_kb())
         return
 
-    # 每条消息展示2个授权码
+    # 每条消息展示2个授权码（横向两列）
     for i in range(0, len(rows), 2):
         chunk = rows[i:i + 2]
-        blocks = []
+        items = []
         btn_row = []
 
         for j, r in enumerate(chunk, start=i + 1):
@@ -542,9 +542,8 @@ async def show_used(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             else:
                 s_str, e_str, remain = '—', '—', f'{CODE_DURATION_HOURS}小时'
 
-            blocks.append(
-                f'{j}. 🔑 <code>{r["code"]}</code>  🏠 {room}\n'
-                f'⏰ {s_str} → {e_str} · 剩余 <b>{remain}</b>'
+            items.append(
+                f'{j}. 🔑<code>{r["code"]}</code> 🏠{room} ⏳<b>{remain}</b>'
             )
 
             # 仅在“已进入房间（有房间号）”时显示释放按钮
@@ -556,9 +555,10 @@ async def show_used(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     )
                 )
 
+        line = '    ｜    '.join(items)
         reply_markup = InlineKeyboardMarkup([btn_row]) if btn_row else None
         await update.message.reply_text(
-            '\n\n'.join(blocks),
+            line,
             parse_mode='HTML',
             reply_markup=reply_markup,
         )
