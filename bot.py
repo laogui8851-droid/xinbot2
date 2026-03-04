@@ -248,11 +248,46 @@ class DB:
         finally:
             conn.close()
 
-    def recall(self, pool_id, operator_id):
+    def release_room(self, pool_id, operator_id):
+        """释放房间：只解除房间绑定，不停止计时，不回收授权码"""
         conn = self._c()
         try:
             cur = conn.cursor()
-            # 先获取 code 以便同步释放 auth_code_pool
+            # 获取 code
+            cur.execute(f"SELECT code FROM {TBL_CODES} WHERE pool_id=%s", (pool_id,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            code = row[0]
+
+            # 权限检查（非 ROOT 只能释放自己的）
+            if operator_id != OWNER_ID:
+                cur.execute(
+                    f"SELECT 1 FROM {TBL_CODES} WHERE pool_id=%s AND assigned_to=%s AND status='assigned'",
+                    (pool_id, operator_id),
+                )
+                if not cur.fetchone():
+                    return False
+
+            # 只释放 auth_code_pool 中的房间绑定，不动 auth_code_pool_xxx 的状态和计时
+            try:
+                cur.execute(
+                    "UPDATE auth_code_pool SET in_use=0, bound_room=NULL "
+                    "WHERE UPPER(code)=UPPER(%s)",
+                    (code,)
+                )
+            except Exception:
+                pass
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def recall(self, pool_id, operator_id):
+        """回收授权码：彻底释放房间并把码变回未使用"""
+        conn = self._c()
+        try:
+            cur = conn.cursor()
             cur.execute(f"SELECT code FROM {TBL_CODES} WHERE pool_id=%s", (pool_id,))
             row = cur.fetchone()
             code = row[0] if row else None
@@ -270,7 +305,6 @@ class DB:
                     (pool_id, operator_id),
                 )
             ok = cur.rowcount > 0
-            # 同步释放 auth_code_pool 中的房间
             if ok and code:
                 try:
                     cur.execute(
@@ -570,20 +604,18 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text('👇 使用下方按钮操作', reply_markup=_kb())
         return
 
-    # ── 结束（回收）──
+    # ── 释放房间（不停止计时，只解除房间绑定）──
     if data.startswith('end:'):
         pool_id = int(data.split(':')[1])
-        ok = db.recall(pool_id, uid)
+        ok = db.release_room(pool_id, uid)
         if ok:
-            s = db.stats()
             await q.edit_message_text(
-                f'✅ <b>房间已释放</b>\n\n'
-                f'授权码已回收至未使用\n'
-                f'📦 未使用：<b>{s["available"]}</b> 个',
+                '✅ <b>房间已释放</b>\n\n'
+                '授权码计时继续，可用该码开设新房间',
                 parse_mode='HTML',
             )
         else:
-            await q.edit_message_text('❌ 操作失败（不属于您或已回收）')
+            await q.edit_message_text('❌ 操作失败（不属于您或已释放）')
         return
 
     # ── ROOT 踢人 ──
