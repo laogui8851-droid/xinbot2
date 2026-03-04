@@ -442,9 +442,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if expired < 0:
             expired = 0
         sent = await update.message.reply_text(
-            f'☁️ <b>云际会议</b>\n'
-            f'━━━━━━━━━━━━━━━\n\n'
-            f'📊 <b>授权码总览</b>\n\n'
+            f'☁️ <b>云际会议</b> ━━ <b>授权码总览</b>\n\n'
             f'  📦 总计：<b>{s["total"]}</b> 个\n'
             f'  🟢 使用中：<b>{s["assigned"]}</b> 个\n'
             f'  🔵 未使用：<b>{s["available"]}</b> 个\n'
@@ -459,14 +457,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        '☁️ <b>云际会议 · 授权码管理</b>\n'
-        '━━━━━━━━━━━━━━━\n\n'
+        '☁️ <b>云际会议</b> ━━ <b>授权码管理</b>\n\n'
         '📌 <b>使用说明</b>\n\n'
         '  🟢 <b>创建会议</b>：授权码 + 房间号\n'
         '  🔵 <b>加入会议</b>：创建者授权码 + 房间号\n\n'
         '  ⏰ 第一次进入房间后授权码开始计时\n'
         '  🔑 一码一房间，会议结束后可再次开设\n\n'
-        '━━━━━━━━━━━━━━━\n'
+        '━━━━━━\n'
         '点击下方按钮绑定为管理员（名额有限）',
         parse_mode='HTML',
         reply_markup=InlineKeyboardMarkup([
