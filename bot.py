@@ -404,15 +404,24 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if role in ('root', 'admin'):
         s = db.stats()
-        await update.message.reply_text(
-            f'☁️ <b>云际会议</b>\n━━━━━━━━━━━━━━━\n\n'
-            f'👋 欢迎回来，{u.first_name}！\n\n'
-            f'📊 授权码：共 <b>{s["total"]}</b> · '
-            f'已使用 <b>{s["assigned"]}</b> · '
-            f'未使用 <b>{s["available"]}</b>\n\n'
+        expired = s['total'] - s['assigned'] - s['available']
+        if expired < 0:
+            expired = 0
+        sent = await update.message.reply_text(
+            f'☁️ <b>云际会议</b>\n'
+            f'━━━━━━━━━━━━━━━\n\n'
+            f'📊 <b>授权码总览</b>\n\n'
+            f'  📦 总计：<b>{s["total"]}</b> 个\n'
+            f'  🟢 使用中：<b>{s["assigned"]}</b> 个\n'
+            f'  🔵 未使用：<b>{s["available"]}</b> 个\n'
+            f'  🔴 已过期：<b>{expired}</b> 个\n\n'
             f'👇 点击下方按钮查看',
             parse_mode='HTML', reply_markup=_kb(),
         )
+        try:
+            await sent.pin(disable_notification=True)
+        except Exception:
+            pass
         return
 
     await update.message.reply_text(
