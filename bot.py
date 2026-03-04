@@ -517,37 +517,50 @@ async def show_used(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     role = db.role(u.id)
     rows = db.assigned(tid=None if role == 'root' else u.id)
 
-    msg = ''
-    if expired_count:
-        msg += f'⏰ 已过期 <b>{expired_count}</b> 个（已自动释放）\n\n'
+    await update.message.reply_text(
+        f'📤 <b>使用中 {len(rows)} 个</b>  ｜  🔴 <b>已过期 {expired_count} 个</b>',
+        parse_mode='HTML',
+        reply_markup=_kb(),
+    )
 
     if not rows:
-        msg += '📤 <b>使用中 0 个</b>\n━━━━━━━━━━━━━━━\n\n暂无'
-        await update.message.reply_text(msg, parse_mode='HTML', reply_markup=_kb())
+        await update.message.reply_text('暂无', reply_markup=_kb())
         return
 
-    msg += f'📤 <b>使用中 {len(rows)} 个</b>\n━━━━━━━━━━━━━━━'
-    await update.message.reply_text(msg, parse_mode='HTML')
+    # 每条消息展示2个授权码
+    for i in range(0, len(rows), 2):
+        chunk = rows[i:i + 2]
+        blocks = []
+        btn_row = []
 
-    for i, r in enumerate(rows, 1):
-        at   = r.get('assigned_at') or ''
-        room = r.get('bound_room') or '—'
-        if at:
-            s_str, e_str, remain, _ = _time_info(at)
-        else:
-            s_str, e_str, remain = '—', '—', f'{CODE_DURATION_HOURS}小时'
-        card = (
-            f'{i}. 🔑 <code>{r["code"]}</code>  🏠 {room}\n'
-            f'⏰ {s_str} → {e_str} · 剩余 <b>{remain}</b>'
-        )
-        await update.message.reply_text(
-            card, parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    f'🏠 释放房间',
-                    callback_data=f'end:{r["pool_id"]}'
+        for j, r in enumerate(chunk, start=i + 1):
+            at = r.get('assigned_at') or ''
+            room_raw = (r.get('bound_room') or '').strip()
+            room = room_raw if room_raw else '—'
+            if at:
+                s_str, e_str, remain, _ = _time_info(at)
+            else:
+                s_str, e_str, remain = '—', '—', f'{CODE_DURATION_HOURS}小时'
+
+            blocks.append(
+                f'{j}. 🔑 <code>{r["code"]}</code>  🏠 {room}\n'
+                f'⏰ {s_str} → {e_str} · 剩余 <b>{remain}</b>'
+            )
+
+            # 仅在“已进入房间（有房间号）”时显示释放按钮
+            if room_raw:
+                btn_row.append(
+                    InlineKeyboardButton(
+                        f'🏠 释放{r["code"]}',
+                        callback_data=f'end:{r["pool_id"]}'
+                    )
                 )
-            ]]),
+
+        reply_markup = InlineKeyboardMarkup([btn_row]) if btn_row else None
+        await update.message.reply_text(
+            '\n\n'.join(blocks),
+            parse_mode='HTML',
+            reply_markup=reply_markup,
         )
 
 
@@ -606,13 +619,21 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pool_id = int(data.split(':')[1])
         ok = db.release_room(pool_id, uid)
         if ok:
-            await q.edit_message_text(
-                '✅ <b>房间已释放</b>\n\n'
-                '授权码计时继续，可用该码开设新房间',
-                parse_mode='HTML',
-            )
+            current_markup = q.message.reply_markup
+            if current_markup and current_markup.inline_keyboard:
+                new_keyboard = []
+                for row in current_markup.inline_keyboard:
+                    new_row = [btn for btn in row if btn.callback_data != data]
+                    if new_row:
+                        new_keyboard.append(new_row)
+
+                if new_keyboard:
+                    await q.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(new_keyboard))
+                else:
+                    await q.edit_message_reply_markup(reply_markup=None)
+            await q.answer('✅ 房间已释放（计时继续）')
         else:
-            await q.edit_message_text('❌ 操作失败（不属于您或已释放）')
+            await q.answer('❌ 操作失败（不属于您或已释放）', show_alert=True)
         return
 
     # ── ROOT 踢人 ──
