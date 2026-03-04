@@ -486,8 +486,9 @@ async def show_used(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode='HTML', reply_markup=_kb())
         return
 
-    msg += f'📤 <b>使用中 {len(rows)} 个</b>\n━━━━━━━━━━━━━━━\n\n'
-    buttons = []
+    msg += f'📤 <b>使用中 {len(rows)} 个</b>\n━━━━━━━━━━━━━━━'
+    await update.message.reply_text(msg, parse_mode='HTML')
+
     for i, r in enumerate(rows, 1):
         at   = r.get('assigned_at') or ''
         room = r.get('bound_room') or '—'
@@ -495,21 +496,19 @@ async def show_used(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s_str, e_str, remain, _ = _time_info(at)
         else:
             s_str, e_str, remain = '—', '—', f'{CODE_DURATION_HOURS}小时'
-        msg += (
+        card = (
             f'{i}. 🔑 <code>{r["code"]}</code>  🏠 {room}\n'
-            f'    ⏰ {s_str} → {e_str} · 剩余 <b>{remain}</b>\n\n'
+            f'⏰ {s_str} → {e_str} · 剩余 <b>{remain}</b>'
         )
-        buttons.append([
-            InlineKeyboardButton(
-                f'🏠 释放 {r["code"]}',
-                callback_data=f'end:{r["pool_id"]}'
-            )
-        ])
-
-    await update.message.reply_text(
-        msg, parse_mode='HTML',
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+        await update.message.reply_text(
+            card, parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f'🏠 释放房间',
+                    callback_data=f'end:{r["pool_id"]}'
+                )
+            ]]),
+        )
 
 
 async def show_unused(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
